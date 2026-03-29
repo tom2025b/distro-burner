@@ -1,0 +1,24 @@
+[package]
+name = "distro-burner"
+version = "0.1.0"
+edition = "2021"
+description = "Download, SHA256-verify, and dd-burn Linux ISOs to target partitions"
+
+[[bin]]
+name = "distro-burner"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# HTTP downloads (blocking mode — sequential burns don't need async)
+reqwest = { version = "0.12", features = ["blocking"] }
+# SHA-256 hashing
+sha2 = "0.10"
+hex = "0.4"
+# Terminal progress bars
+indicatif = "0.17"
+# Error handling
+anyhow = "1"
+# Timestamps in log entries
+chrono = "0.4"
