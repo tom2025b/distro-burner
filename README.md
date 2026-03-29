@@ -1,6 +1,14 @@
-# distro-burner
+# distro-burner · `python-wrapper` branch
 
-A fast Rust CLI that downloads five major Linux ISOs from official mirrors, verifies their SHA256 checksums, and burns each one to a target partition via `sudo dd`.
+> **Two branches, one CLI surface:**
+> | Branch | Implementation | When to use |
+> |---|---|---|
+> | [`main`](../../tree/main) | Pure Rust (no Python required) | Production / fast builds |
+> | **`python-wrapper`** ← you are here | Python logic + Rust launcher | Easier to hack / extend |
+
+---
+
+A CLI that downloads five Linux ISOs from official mirrors, verifies their SHA256 checksums, and burns each one to a target partition via `sudo dd`.
 
 ```
 distro-burner --isos ubuntu,debian --partitions sda3,sda5
@@ -8,30 +16,22 @@ distro-burner --isos ubuntu,debian --partitions sda3,sda5
 
 ---
 
-## Features
+## How this branch works
 
-- **Downloads from canonical mirrors** — Ubuntu, Fedora, Pop!_OS, Debian, Arch Linux
-- **SHA256 verification** — fetches official checksum files and compares; bails loudly on any mismatch so a corrupt ISO never reaches `dd`
-- **Live progress bars** — byte-count display during both download and hashing (via `indicatif`)
-- **Y/N prompt before every burn** — no silent overwrites
-- **Idempotent downloads** — skips re-downloading files that already exist and are non-empty
-- **Dry-run mode** — prints what would happen without touching the filesystem or any disk
-- **Persistent log file** — every event timestamped, including failures and user skips
-- **Injection-safe** — partition names are validated before being passed to `sudo dd`
+```
+distro-burner  (Rust binary — thin launcher)
+       │
+       └─► python3 distro_burner.py  (all real logic)
+                   │
+                   ├─ requests      (streaming HTTP downloads)
+                   ├─ tqdm          (progress bars)
+                   ├─ hashlib       (SHA-256, stdlib)
+                   └─ subprocess    (sudo dd)
+```
 
----
+The Rust binary exists purely to give users a single executable in their `PATH`. It locates `distro_burner.py` (first next to itself, then in the repo root for `cargo run`) and `exec`s `python3` with all arguments forwarded unchanged.
 
-## Supported ISOs
-
-| Key      | Distro                              | Mirror                                      |
-|----------|-------------------------------------|---------------------------------------------|
-| `ubuntu` | Ubuntu 24.04.2 LTS Desktop (amd64)  | releases.ubuntu.com                         |
-| `fedora` | Fedora Workstation 42 Live (x86_64) | dl.fedoraproject.org                        |
-| `popos`  | Pop!\_OS 22.04 LTS Intel/AMD        | iso.pop-os.org                              |
-| `debian` | Debian 12.9 Netinstall (amd64)      | cdimage.debian.org                          |
-| `arch`   | Arch Linux latest (x86\_64)         | mirror.rackspace.com / archlinux.org        |
-
-> **Note on URLs:** Point-release numbers (e.g. `24.04.2`, `12.9.0`, `42-1.1`) drift between distro releases. If a download returns 404, check the distro's official release page and update the relevant `IsoSpec` in `src/main.rs`. Each entry is clearly commented.
+All business logic — ISO catalogue, checksum parsing, verification, burn prompts, logging — lives in the Python script and is easy to edit without recompiling.
 
 ---
 
@@ -39,59 +39,90 @@ distro-burner --isos ubuntu,debian --partitions sda3,sda5
 
 ### Prerequisites
 
-- Rust toolchain — [rustup.rs](https://rustup.rs)
-- `sudo` access on the machine (only needed for the burn step)
-- `gh` CLI (optional, for repo management)
+- Python 3.10+ — [python.org](https://python.org)
+- Rust toolchain — [rustup.rs](https://rustup.rs) *(only needed to build the launcher)*
+- `sudo` access *(only needed for the burn step)*
 
-### Build
+### Install Python dependencies
+
+```zsh
+pip install -r requirements.txt
+# or just: pip install requests tqdm
+```
+
+`tqdm` is optional — if missing, progress output is suppressed but everything else works.
+
+### Build the Rust launcher
 
 ```zsh
 git clone https://github.com/tom2025b/distro-burner
 cd distro-burner
+git checkout python-wrapper
 cargo build --release
-# Binary at: ./target/release/distro-burner
+```
+
+The binary at `target/release/distro-burner` looks for `distro_burner.py` next to itself, so copy both when installing:
+
+```zsh
+cp target/release/distro-burner ~/bin/
+cp distro_burner.py ~/bin/
+```
+
+Or just run from the repo root with `cargo run --`:
+
+```zsh
+cargo run -- --isos ubuntu --dry-run
+```
+
+### Run the Python script directly (no Rust required)
+
+```zsh
+python3 distro_burner.py --isos all --dry-run
 ```
 
 ---
 
 ## Usage
 
-### Download + verify + burn
-
 ```zsh
-# Burn two ISOs to two partitions (order must match)
+# Download + verify + burn two ISOs
 distro-burner --isos ubuntu,debian --partitions sda3,sda5
 
 # Burn all five ISOs
 distro-burner --isos all --partitions sda3,sda5,sda7,sda9,sda11
-```
 
-### Download + verify only (no burn)
-
-```zsh
-# Omit --partitions to skip the dd step entirely
+# Download + verify only (no burn)
 distro-burner --isos fedora,arch --output-dir ~/isos
-```
 
-### Dry run (print commands, touch nothing)
-
-```zsh
+# Dry run — print commands, touch nothing
 distro-burner --isos all --partitions sda3,sda5,sda7,sda9,sda11 --dry-run
 ```
 
 ### Full flag reference
 
 ```
-Options:
-  --isos <ISOS>            Comma-separated ISO keys or 'all'  [default: all]
-  --partitions <PARTS>     Comma-separated partition names, one per ISO
-                           Accepts both 'sda3' and '/dev/sda3'
-  --dry-run                Print what would be done; download/burn nothing
-  --output-dir <DIR>       Where to save downloaded ISOs  [default: .]
-  --log-file <FILE>        Log file path  [default: distro-burner.log]
-  -h, --help               Print help
-  -V, --version            Print version
+  --isos KEYS        Comma-separated keys or 'all'          (default: all)
+  --partitions PARTS Comma-separated partitions, one per ISO
+                     Accepts 'sda3' or '/dev/sda3'
+  --dry-run          Print what would happen; download/burn nothing
+  --output-dir DIR   Where to save ISOs                     (default: .)
+  --log-file FILE    Log file path                          (default: distro-burner.log)
+  -h, --help
 ```
+
+---
+
+## Supported ISOs
+
+| Key      | Distro                              | Mirror                        |
+|----------|-------------------------------------|-------------------------------|
+| `ubuntu` | Ubuntu 24.04.2 LTS Desktop (amd64)  | releases.ubuntu.com           |
+| `fedora` | Fedora Workstation 42 Live (x86_64) | dl.fedoraproject.org          |
+| `popos`  | Pop!\_OS 22.04 LTS Intel/AMD        | iso.pop-os.org                |
+| `debian` | Debian 12.9 Netinstall (amd64)      | cdimage.debian.org            |
+| `arch`   | Arch Linux latest (x86\_64)         | mirror.rackspace.com          |
+
+> Point-release numbers drift. If a URL 404s, update the version string in the `ISO_CATALOGUE` list near the top of `distro_burner.py`.
 
 ---
 
@@ -99,52 +130,58 @@ Options:
 
 ```
 for each ISO:
-  1. Download  →  streams to disk with progress bar
-                  skips if file already exists (idempotent)
-  2. Checksum  →  fetches official SHA256SUMS from the distro mirror
+  1. Download  →  streams to disk in 64 KiB chunks with tqdm bar
+                  skips existing non-empty files (idempotent)
+  2. Checksum  →  fetches the distro's official SHA256SUMS file
                   parses the hash for this filename
-  3. Verify    →  hashes the local file with SHA-256
-                  bails on mismatch — no ISO reaches dd if it's corrupt
-  4. Prompt    →  prints the exact sudo dd command and asks Y/N
-  5. Burn      →  shells out to: sudo dd if=<iso> of=/dev/<part> bs=4M status=progress oflag=sync
-                  logs result (success / failure / skipped by user)
+  3. Verify    →  hashes the local file with hashlib.sha256()
+                  sys.exit() on mismatch; deletes corrupt file
+  4. Prompt    →  prints exact sudo dd command, asks Y/N
+  5. Burn      →  subprocess.run(["sudo", "dd", ...])
+                  logs result to file
 ```
 
-### Checksum format handling
+### Checksum formats
 
-Different distros publish checksums in different formats; both are supported:
-
-| Format   | Example line                                       | Distros              |
-|----------|----------------------------------------------------|----------------------|
-| Standard | `abc123…  ubuntu-24.04.2-desktop-amd64.iso`        | Ubuntu, Debian, Pop, Arch |
+| Format   | Example                                               | Distros              |
+|----------|-------------------------------------------------------|----------------------|
+| Standard | `abc123…  ubuntu-24.04.2-desktop-amd64.iso`           | Ubuntu, Debian, Pop, Arch |
 | Fedora   | `SHA256 (Fedora-Workstation-Live-x86_64-42-1.1.iso) = abc123…` | Fedora |
-
-Arch Linux publishes dated ISO filenames (e.g. `archlinux-2026.01.01-x86_64.iso`) in its checksum file, but hosts a stable `archlinux-x86_64.iso` symlink for download. distro-burner handles this with a substring match on `x86_64.iso`.
 
 ---
 
 ## Log format
 
-Every run appends to the log file:
+```
+[2026-03-28 14:05:01] INFO distro-burner started  isos=ubuntu  dry_run=False
+[2026-03-28 14:05:02] INFO DOWNLOAD START: https://releases.ubuntu.com/…
+[2026-03-28 14:11:33] INFO DOWNLOAD DONE: ubuntu-24.04.2-desktop-amd64.iso (5173995520 bytes)
+[2026-03-28 14:11:33] INFO SHA256 PASS: ubuntu-24.04.2-desktop-amd64.iso
+[2026-03-28 14:11:35] INFO BURN START: ubuntu-24.04.2-desktop-amd64.iso → /dev/sda3
+[2026-03-28 14:16:02] INFO BURN DONE: ubuntu-24.04.2-desktop-amd64.iso → /dev/sda3
+```
 
-```
-[2026-03-28 14:05:01] distro-burner started  isos=ubuntu,debian  dry_run=false
-[2026-03-28 14:05:01] DOWNLOAD START: https://releases.ubuntu.com/24.04/ubuntu-24.04.2-desktop-amd64.iso
-[2026-03-28 14:11:33] DOWNLOAD DONE: ubuntu-24.04.2-desktop-amd64.iso (5173995520 bytes)
-[2026-03-28 14:11:33] SHA256 PASS: ubuntu-24.04.2-desktop-amd64.iso
-[2026-03-28 14:11:35] BURN START: ubuntu-24.04.2-desktop-amd64.iso → /dev/sda3
-[2026-03-28 14:16:02] BURN DONE: ubuntu-24.04.2-desktop-amd64.iso → /dev/sda3
-[2026-03-28 14:16:02] distro-burner finished successfully
-```
+---
+
+## Extending / hacking
+
+Because all logic is in plain Python, customisation is straightforward:
+
+- **Add a new distro** — append an entry to `ISO_CATALOGUE` in `distro_burner.py`
+- **Change checksum format** — add a branch in `fetch_expected_hash()`
+- **Add GPG verification** — call `gpg --verify` after the SHA256 check
+- **Parallel downloads** — swap the `for` loop for `concurrent.futures.ThreadPoolExecutor`
+
+No recompile needed for any of the above.
 
 ---
 
 ## Safety notes
 
-- **dd is destructive.** Always double-check `--partitions` before confirming the Y/N prompt. There is no undo.
-- distro-burner does not call `sudo` at startup — only at the burn step, and only after your explicit confirmation.
-- Partition names are validated against `[a-zA-Z0-9/_-]` before being passed to the shell.
-- SHA256 verification is mandatory for every ISO before burn; this cannot be skipped except via `--dry-run`.
+- `dd` is destructive. Always verify `--partitions` before confirming the Y/N prompt.
+- Partition names are validated against `[a-zA-Z0-9/_-]` before reaching `subprocess`.
+- SHA256 verification cannot be skipped (except with `--dry-run`).
+- A corrupt download is deleted automatically so a re-run fetches fresh.
 
 ---
 
