@@ -12,11 +12,10 @@ Or invoked by the Rust wrapper binary:
 import argparse
 import hashlib
 import logging
-import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+import tempfile
 from pathlib import Path
 
 # ── Optional deps (graceful fallbacks if not installed) ──────────────────────
@@ -29,16 +28,14 @@ try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
-    HAS_TQDM = False  # Falls back to periodic print statements
+    HAS_TQDM = False
 
 # ── ISO catalogue ─────────────────────────────────────────────────────────────
-
-# Each entry: (key, display_name, iso_url, checksum_url, iso_filename,
-#              checksum_grep, checksum_format)
 #
-# checksum_grep  : substring to find this ISO's line in the checksum file
 # checksum_format: "standard" = "<hash>  <filename>"
 #                  "fedora"   = "SHA256 (<filename>) = <hash>"
+#
+# Filename matching is now exact (against iso_filename), not a substring grep.
 #
 # NOTE: Point-release numbers drift — if a URL 404s, check the distro's
 # release page and update the version string here.
@@ -50,7 +47,6 @@ ISO_CATALOGUE = [
         "iso_url": "https://releases.ubuntu.com/24.04/ubuntu-24.04.2-desktop-amd64.iso",
         "checksum_url": "https://releases.ubuntu.com/24.04/SHA256SUMS",
         "iso_filename": "ubuntu-24.04.2-desktop-amd64.iso",
-        "checksum_grep": "ubuntu-24.04.2-desktop-amd64.iso",
         "checksum_format": "standard",
     },
     {
@@ -65,7 +61,6 @@ ISO_CATALOGUE = [
             "Workstation/x86_64/iso/Fedora-Workstation-42-1.1-x86_64-CHECKSUM"
         ),
         "iso_filename": "Fedora-Workstation-Live-x86_64-42-1.1.iso",
-        "checksum_grep": "Fedora-Workstation-Live-x86_64-42-1.1.iso",
         "checksum_format": "fedora",
     },
     {
@@ -74,7 +69,6 @@ ISO_CATALOGUE = [
         "iso_url": "https://iso.pop-os.org/22.04/amd64/intel/22.04.4/pop-os_22.04_amd64_intel_264.iso",
         "checksum_url": "https://iso.pop-os.org/22.04/amd64/intel/22.04.4/SHA256SUMS",
         "iso_filename": "pop-os_22.04_amd64_intel_264.iso",
-        "checksum_grep": "pop-os_22.04_amd64_intel_264.iso",
         "checksum_format": "standard",
     },
     {
@@ -83,18 +77,17 @@ ISO_CATALOGUE = [
         "iso_url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.9.0-amd64-netinst.iso",
         "checksum_url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS",
         "iso_filename": "debian-12.9.0-amd64-netinst.iso",
-        "checksum_grep": "debian-12.9.0-amd64-netinst.iso",
         "checksum_format": "standard",
     },
     {
         "key": "arch",
         "display": "Arch Linux latest (x86_64)",
-        # Rackspace hosts a stable symlink; checksum file uses dated names —
-        # we match on "x86_64.iso" substring to avoid needing the exact date.
+        # Rackspace hosts a stable symlink; Arch's checksum file lists both
+        # the dated name and the stable "archlinux-x86_64.iso" symlink name —
+        # exact matching against iso_filename picks up the latter directly.
         "iso_url": "https://mirror.rackspace.com/archlinux/iso/latest/archlinux-x86_64.iso",
         "checksum_url": "https://archlinux.org/iso/latest/sha256sums.txt",
         "iso_filename": "archlinux-x86_64.iso",
-        "checksum_grep": "x86_64.iso",
         "checksum_format": "standard",
     },
 ]
@@ -156,12 +149,10 @@ def setup_logger(log_path: str) -> logging.Logger:
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
 
-    # File handler — always on
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Console handler — INFO and above
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("  %(message)s"))
@@ -188,8 +179,12 @@ def parse_iso_selection(isos_arg: str) -> list[dict]:
 
 
 def download_iso(spec: dict, dest: Path, logger: logging.Logger) -> None:
-    """Stream-download an ISO to dest, showing a progress bar."""
-    # Idempotent: skip if already present and non-empty.
+    """Stream-download an ISO to dest via a temp file.
+
+    Downloads into a .tmp sibling file so that a failed or interrupted
+    transfer never leaves a partial file at the final path.  The temp file
+    is auto-deleted on any error; on success it is atomically renamed to dest.
+    """
     if dest.exists() and dest.stat().st_size > 0:
         logger.info("SKIP (exists): %s", dest.name)
         print(f"  ✓ Already present, skipping: {dest.name}")
@@ -198,7 +193,8 @@ def download_iso(spec: dict, dest: Path, logger: logging.Logger) -> None:
     logger.info("DOWNLOAD START: %s", spec["iso_url"])
     print(f"  ↓ {spec['iso_url']}")
 
-    with requests.get(spec["iso_url"], stream=True, timeout=60) as resp:
+    # timeout=(connect_s, read_s): 10 s to connect, no per-chunk read limit.
+    with requests.get(spec["iso_url"], stream=True, timeout=(10, None)) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("content-length", 0))
 
@@ -214,27 +210,49 @@ def download_iso(spec: dict, dest: Path, logger: logging.Logger) -> None:
             )
         else:
             bar = None
-            print(f"  (tqdm not installed — progress suppressed)")
+            print("  (tqdm not installed — progress suppressed)")
 
         written = 0
         chunk_size = 65_536  # 64 KiB
 
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                f.write(chunk)
-                written += len(chunk)
-                if bar:
-                    bar.update(len(chunk))
+        # Write into a temp file in the same directory so rename() is atomic
+        # (same filesystem).  delete=False: we rename on success or unlink on
+        # error ourselves.
+        with tempfile.NamedTemporaryFile(
+            dir=dest.parent,
+            prefix=dest.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            try:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    tmp.write(chunk)
+                    written += len(chunk)
+                    if bar:
+                        bar.update(len(chunk))
+                tmp.flush()
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
         if bar:
             bar.close()
 
+    # Atomic rename: replaces dest if it somehow appeared between the check
+    # above and now (idempotent + race-safe).
+    tmp_path.rename(dest)
     print(f"  ✓ Saved {written:,} bytes → {dest}")
     logger.info("DOWNLOAD DONE: %s (%d bytes)", dest.name, written)
 
 
 def fetch_expected_hash(spec: dict, logger: logging.Logger) -> str:
-    """Download the distro's checksum file and extract the SHA256 for this ISO."""
+    """Download the distro's checksum file and extract the SHA256 for this ISO.
+
+    Uses exact filename matching (not a substring search) to avoid false
+    matches when a checksum file contains multiple entries with similar names
+    (e.g. Arch Linux lists both dated and stable symlink filenames).
+    """
     logger.debug("Fetching checksum: %s", spec["checksum_url"])
     print(f"  ⧗ Fetching checksum: {spec['checksum_url']}")
 
@@ -242,32 +260,36 @@ def fetch_expected_hash(spec: dict, logger: logging.Logger) -> str:
     resp.raise_for_status()
     body = resp.text
 
-    grep = spec["checksum_grep"]
-    fmt  = spec["checksum_format"]
+    target = spec["iso_filename"]
+    fmt    = spec["checksum_format"]
 
     for line in body.splitlines():
         line = line.strip()
-        if grep not in line:
+        if not line or line.startswith("#"):
             continue
+
         if fmt == "standard":
             # "<hash>  <filename>"  or  "<hash> *<filename>"
             parts = line.split(None, 1)
             if len(parts) == 2 and len(parts[0]) == 64:
-                return parts[0]
+                filename = parts[1].lstrip("*").strip()
+                if filename == target:
+                    return parts[0]
+
         elif fmt == "fedora":
             # "SHA256 (<filename>) = <hash>"
-            m = re.search(r"=\s+([0-9a-fA-F]{64})$", line)
-            if m:
-                return m.group(1)
+            m = re.match(r"SHA256\s+\((.+)\)\s*=\s*([0-9a-fA-F]{64})$", line)
+            if m and m.group(1) == target:
+                return m.group(2)
 
     raise RuntimeError(
-        f"Hash for '{grep}' not found in {spec['checksum_url']}"
+        f"Hash for '{target}' not found in {spec['checksum_url']}"
     )
 
 
 def verify_sha256(dest: Path, expected: str, spec: dict, logger: logging.Logger) -> None:
-    """Hash the local file and bail if it doesn't match expected."""
-    print(f"  # Verifying SHA256 …")
+    """Hash the local file; delete it and exit loudly on mismatch."""
+    print("  # Verifying SHA256 …")
     total = dest.stat().st_size
     hasher = hashlib.sha256()
 
@@ -277,7 +299,7 @@ def verify_sha256(dest: Path, expected: str, spec: dict, logger: logging.Logger)
             unit="B",
             unit_scale=True,
             unit_divisor=1024,
-            desc=f"  hashing",
+            desc="  hashing",
             ncols=72,
             leave=False,
         )
@@ -304,14 +326,14 @@ def verify_sha256(dest: Path, expected: str, spec: dict, logger: logging.Logger)
             "SHA256 FAIL: %s  expected=%s  actual=%s",
             spec["iso_filename"], expected, actual,
         )
+        # Delete the corrupt file before exiting so a re-run downloads fresh.
+        dest.unlink(missing_ok=True)
         sys.exit(
             f"\n  ✗ SHA256 MISMATCH for {spec['iso_filename']}!\n"
             f"    expected : {expected}\n"
             f"    actual   : {actual}\n"
-            f"  Deleting corrupt file."
+            f"  Corrupt file deleted. Re-run to fetch a fresh copy."
         )
-        # Remove corrupt file so a re-run triggers a fresh download.
-        dest.unlink(missing_ok=True)
 
 
 def handle_burn(
@@ -326,23 +348,23 @@ def handle_burn(
         print(f"  ⊘ No partition given — skipping burn for {spec['display']}")
         return
 
-    # Validate partition name to prevent shell injection.
     if not re.fullmatch(r"[a-zA-Z0-9/_-]+", partition):
         sys.exit(f"Refusing suspicious partition name '{partition}'")
 
     dev = partition if partition.startswith("/dev/") else f"/dev/{partition}"
-    cmd = f"sudo dd if={dest} of={dev} bs=4M status=progress oflag=sync"
+    dd_args = ["sudo", "dd", f"if={dest}", f"of={dev}", "bs=4M", "status=progress", "oflag=sync"]
+    cmd_str = " ".join(dd_args)
 
     if dry_run:
-        print(f"  [DRY RUN] would run: {cmd}")
-        logger.info("DRY RUN burn: %s", cmd)
+        print(f"  [DRY RUN] would run: {cmd_str}")
+        logger.info("DRY RUN burn: %s", cmd_str)
         return
 
     # ── Y/N confirmation ─────────────────────────────────────────
     print()
     print(f"  Target  : {dev}")
     print(f"  Source  : {dest}")
-    print(f"  Command : {cmd}")
+    print(f"  Command : {cmd_str}")
     print()
     print(f"  ⚠  WARNING: this will PERMANENTLY OVERWRITE {dev}.")
     answer = input("  Proceed? [y/N] ").strip().lower()
@@ -353,20 +375,17 @@ def handle_burn(
         return
 
     # ── Run sudo dd ───────────────────────────────────────────────
-    logger.info("BURN START: %s → %s", spec["iso_filename"], dev)
+    logger.info("BURN START: %s → %s  cmd=%s", spec["iso_filename"], dev, cmd_str)
 
-    result = subprocess.run(
-        ["sudo", "dd", f"if={dest}", f"of={dev}", "bs=4M", "status=progress", "oflag=sync"],
-        check=False,
-    )
+    result = subprocess.run(dd_args, check=False)
 
     if result.returncode == 0:
         print(f"  ✓ Burn complete: {spec['iso_filename']} → {dev}")
         logger.info("BURN DONE: %s → %s", spec["iso_filename"], dev)
     else:
         logger.error(
-            "BURN FAILED (exit %d): %s → %s",
-            result.returncode, spec["iso_filename"], dev,
+            "BURN FAILED (exit %d): %s → %s  cmd=%s",
+            result.returncode, spec["iso_filename"], dev, cmd_str,
         )
         sys.exit(f"sudo dd failed with exit code {result.returncode} for {dev}")
 
@@ -379,7 +398,6 @@ def main() -> None:
     selected   = parse_iso_selection(args.isos)
     partitions = [p.strip() for p in args.partitions.split(",")] if args.partitions else []
 
-    # Partition count must match ISO count when partitions are supplied.
     if partitions and len(partitions) != len(selected):
         sys.exit(
             f"Got {len(selected)} ISO(s) but {len(partitions)} partition(s). "
