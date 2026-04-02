@@ -148,6 +148,99 @@ Every run appends to the log file:
 
 ---
 
+## Rust Basics — Concepts Used Here
+
+Full tutorial:
+**[rust-basics.md](https://github.com/tom2025b/teacher-thing/blob/main/rust-basics.md)**
+in [teacher-thing](https://github.com/tom2025b/teacher-thing).
+
+### Structs for ISO Specs
+```rust
+struct IsoSpec {
+    key: &'static str,
+    name: &'static str,
+    url: &'static str,
+    checksum_url: &'static str,
+    filename: &'static str,
+}
+
+// &'static str — string slices baked into the binary, no heap allocation
+// These never change so no String needed — static lifetime is correct here
+const UBUNTU: IsoSpec = IsoSpec {
+    key: "ubuntu",
+    name: "Ubuntu 24.04.2 LTS",
+    url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+    checksum_url: "https://releases.ubuntu.com/24.04/SHA256SUMS",
+    filename: "ubuntu-24.04.2-desktop-amd64.iso",
+};
+```
+
+### Result + `?` for the Full Pipeline
+```rust
+use anyhow::{Context, Result};
+
+async fn process_iso(spec: &IsoSpec, out_dir: &str) -> Result<()> {
+    download(spec, out_dir)
+        .await
+        .with_context(|| format!("Download failed: {}", spec.name))?;
+
+    verify_checksum(spec, out_dir)
+        .await
+        .with_context(|| format!("Checksum failed: {}", spec.name))?;
+
+    Ok(())
+    // Each ? returns early with a descriptive error — no nested if/else chains
+}
+```
+
+### Enums for Checksum Format
+```rust
+enum ChecksumFormat {
+    Standard,  // "abc123  filename.iso"
+    Fedora,    // "SHA256 (filename.iso) = abc123"
+}
+
+fn detect_format(line: &str) -> ChecksumFormat {
+    if line.starts_with("SHA256 (") {
+        ChecksumFormat::Fedora
+    } else {
+        ChecksumFormat::Standard
+    }
+}
+
+fn extract_hash(line: &str, filename: &str) -> Option<String> {
+    match detect_format(line) {
+        ChecksumFormat::Standard => parse_standard(line, filename),
+        ChecksumFormat::Fedora   => parse_fedora(line, filename),
+    }
+}
+```
+
+### Iterators + filter_map for Checksum Parsing
+```rust
+fn find_hash(checksum_text: &str, filename: &str) -> Option<String> {
+    checksum_text
+        .lines()
+        .filter(|line| line.contains(filename))
+        .filter_map(|line| extract_hash(line, filename))
+        .next() // take first match
+}
+```
+
+### Input Validation Before Shell Exec
+```rust
+fn validate_partition(name: &str) -> Result<()> {
+    // Only allow safe characters — prevents shell injection
+    let valid = name.chars().all(|c| c.is_alphanumeric() || "/._-".contains(c));
+    if !valid {
+        anyhow::bail!("Invalid partition name: {}", name);
+    }
+    Ok(())
+}
+```
+
+---
+
 ## License
 
 MIT — © Thomas Lane
